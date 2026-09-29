@@ -1,32 +1,26 @@
-// Jeg importerer useEffect til oprydning og useRef til at gemme referencer på tværs af renders
-import { useEffect, useRef } from 'react';
-
-// Jeg importerer GPS-biblioteket fra Expo
+import { useAudioCoach } from './useAudioCoach';
+import { useHistoryStore } from '../store/historyStore';
+import { useRef } from 'react';
 import * as Location from 'expo-location';
-
-// Jeg importerer min globale store hvor løbets data lever
 import { useTrackingStore } from '../store/trackingStore';
+import { useProgramStore } from '../store/programStore';
+import { Coordinate } from '../types/workout';
 
 export function useTracking() {
-  // Jeg henter alt hvad jeg skal bruge fra min store
-  // inklusiv den nye tickMs funktion og elapsedMs tæller
   const { run, elapsedMs, startRun, pauseRun, resumeRun, finishRun, addCoordinate, tickMs } = useTrackingStore();
+  const { addRun } = useHistoryStore();
+  const { getActiveProgram } = useProgramStore();
+  const audioCoach = useAudioCoach();
 
-  // Jeg gemmer en reference til GPS-lytteren så jeg kan stoppe den igen ved pause/stop
   const locationSubscription = useRef<Location.LocationSubscription | null>(null);
-
-  // Jeg gemmer en reference til mit ms-interval så jeg kan stoppe det igen ved pause/stop
   const msInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Jeg starter et interval der kører hvert 10ms og kalder tickMs
-  // Det giver en flydende tæller der er uafhængig af GPS-opdateringer
   const startMsInterval = () => {
     msInterval.current = setInterval(() => {
       tickMs(10);
     }, 10);
   };
 
-  // Jeg stopper ms-intervallet og rydder referencen op så der ikke er memory leaks
   const stopMsInterval = () => {
     if (msInterval.current) {
       clearInterval(msInterval.current);
@@ -34,18 +28,62 @@ export function useTracking() {
     }
   };
 
-  // Jeg beder brugeren om GPS-tilladelse
-  // Hvis tilladelse ikke gives, viser jeg en besked og returnerer false så løbet ikke starter
   const requestPermissions = async () => {
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status !== 'granted') {
-      alert('Stryd har brug for adgang til din placering for at tracke dit løb.');
+      alert('Stryd needs access to your location to track your run.');
       return false;
     }
     return true;
   };
 
-  // Jeg starter løbet — tjekker tilladelse, starter store, ms-interval og GPS-lytter
+  // Jeg tjekker om løberen løb hurtigere end planlagt på interval-sessioner
+  // Kun arbejdsperioder tælles — pauser filtreres fra
+  const checkForPaceImprovement = (
+    completedRun: { distanceMeters: number; durationMs: number; coordinates: Coordinate[] }
+  ): { shouldRegenerate: boolean; session?: any } => {
+    const activeProgram = getActiveProgram();
+    if (!activeProgram) return { shouldRegenerate: false };
+
+    const today = new Date().toISOString().split('T')[0];
+
+    // Jeg finder dagens interval-session
+    const todaySession = activeProgram.sessions.find(
+      s => s.date === today && s.type === 'interval' && !s.completed
+    );
+
+    if (!todaySession || todaySession.goal.type !== 'intervals') {
+      return { shouldRegenerate: false };
+    }
+
+    const plannedPace = todaySession.goal.reps[0]?.targetPaceMinPerKm;
+    if (!plannedPace) return { shouldRegenerate: false };
+
+    // Jeg filtrerer pauser fra — alt under 2 m/s (ca. 8:20 min/km) er pause
+    const PAUSE_THRESHOLD_MS = 2.0;
+    const workCoordinates = completedRun.coordinates.filter(
+      c => c.speed !== null && c.speed > PAUSE_THRESHOLD_MS
+    );
+
+    // Ikke nok data til at bedømme
+    if (workCoordinates.length < 10) return { shouldRegenerate: false };
+
+    // Jeg beregner gennemsnitshastighed kun under arbejdsperioder
+    const avgWorkSpeed = workCoordinates.reduce(
+      (sum, c) => sum + (c.speed ?? 0), 0
+    ) / workCoordinates.length;
+
+    // Jeg konverterer m/s til min/km
+    const actualPaceMinPerKm = 1000 / (avgWorkSpeed * 60);
+
+    // Jeg sammenligner i sekunder — 15+ sek hurtigere udløser regenerering
+    const actualPaceSec = actualPaceMinPerKm * 60;
+    const plannedPaceSec = plannedPace * 60;
+    const shouldRegenerate = (plannedPaceSec - actualPaceSec) >= 15;
+
+    return { shouldRegenerate, session: todaySession };
+  };
+
   const start = async () => {
     const hasPermission = await requestPermissions();
     if (!hasPermission) return;
@@ -53,7 +91,6 @@ export function useTracking() {
     startRun();
     startMsInterval();
 
-    // Jeg starter GPS-lytteren og sender nye koordinater til store'en hvert sekund
     locationSubscription.current = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
@@ -68,11 +105,16 @@ export function useTracking() {
           speed: location.coords.speed,
           altitude: location.coords.altitude,
         });
+        const { run } = useTrackingStore.getState();
+        if (run) {
+          // Jeg bruger checkSessionProgress hvis der er en aktiv session
+          // ellers falder vi tilbage til km-milestones
+          audioCoach.checkSessionProgress(run.distanceMeters, run.coordinates);
+        }
       }
     );
   };
 
-  // Jeg pauser løbet — opdaterer store, stopper ms-interval og GPS-lytter
   const pause = () => {
     pauseRun();
     stopMsInterval();
@@ -80,12 +122,10 @@ export function useTracking() {
     locationSubscription.current = null;
   };
 
-  // Jeg genoptager løbet — opdaterer store, starter ms-interval og GPS-lytter igen
   const resume = async () => {
     resumeRun();
     startMsInterval();
 
-    // Jeg starter GPS-lytteren igen med samme indstillinger som ved start
     locationSubscription.current = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
@@ -100,27 +140,56 @@ export function useTracking() {
           speed: location.coords.speed,
           altitude: location.coords.altitude,
         });
+        const { run } = useTrackingStore.getState();
+        if (run) {
+          // Jeg bruger checkSessionProgress hvis der er en aktiv session
+          // ellers falder vi tilbage til km-milestones
+          audioCoach.checkSessionProgress(run.distanceMeters, run.coordinates);
+        }
       }
     );
   };
 
-  // Jeg afslutter løbet — opdaterer store, stopper ms-interval og GPS-lytter
   const finish = () => {
+    let regenerationInfo: { shouldRegenerate: boolean; session?: any } = { shouldRegenerate: false };
+
+    if (run) {
+      // Jeg tjekker pace FØR vi nulstiller
+      regenerationInfo = checkForPaceImprovement({
+        distanceMeters: run.distanceMeters,
+        durationMs: elapsedMs,
+        coordinates: run.coordinates,
+      });
+
+      addRun({
+        id: run.id,
+        startTime: run.startTime,
+        endTime: Date.now(),
+        durationMs: elapsedMs,
+        coordinates: run.coordinates,
+        distanceMeters: run.distanceMeters,
+      });
+    }
+
+    audioCoach.reset();
     finishRun();
     stopMsInterval();
     locationSubscription.current?.remove();
     locationSubscription.current = null;
+
+    return regenerationInfo;
   };
 
-  // Jeg sørger for oprydning hvis skærmen lukkes mens løbet kører
-  // Den tomme [] betyder at dette kun sættes op én gang når komponenten mountes
-  useEffect(() => {
-    return () => {
-      locationSubscription.current?.remove();
-      stopMsInterval();
-    };
-  }, []);
-
-  // Jeg returnerer det tracking-skærmen skal bruge for at vise data og styre løbet
-  return { run, elapsedMs, start, pause, resume, finish };
+  return {
+    run,
+    elapsedMs,
+    start,
+    pause,
+    resume,
+    finish,
+    startSession: audioCoach.startSession,
+    skipToNextRep: audioCoach.skipToNextRep,
+    pauseRep: audioCoach.pauseRep,
+    resumeRep: audioCoach.resumeRep,
+  };
 }

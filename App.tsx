@@ -1,11 +1,12 @@
-import { StatusBar } from 'expo-status-bar';
-import TrackingScreen from './app/tracking';
+// Jeg importerer min navigationsstruktur fra app-mappen
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import Layout from './app/_layout';
 
+// App er entry-point-komponenten — den renderer bare navigationen
 export default function App() {
   return (
-    <>
-      <TrackingScreen />
-      <StatusBar style="auto" />
-    </>
+    <SafeAreaProvider>
+      <Layout />
+    </SafeAreaProvider>
   );
 }
